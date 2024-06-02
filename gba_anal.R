@@ -1,44 +1,73 @@
 
 rm( list = ls() ) # clear environment
-s = 87542 # seed for reproducibility
+s = 1 # seed for reproducibility
 options( mc.cores = parallel::detectCores() ) # use all parallel CPU cores
 
 library(here) # directory management
 library(tidyverse) # data wrangling
+library(readODS) # reading .ods data
+library(openxlsx) # reading .xlsx data
 library(brms) # model fitting
 library(tidybayes) # posterior manipulation
 library(patchwork) # plot grids
 #library(gt) # tables
+
 theme_set( theme_minimal() )
 
-# read outcome data
-d0 <-
+# prepare folders
+sapply( c("figs","mods"), function(i) if (!dir.exists(i) ) dir.create(i) )
+
+# READ DATA ----
+
+d0 <- read.csv( here("_raw","psych_longit.csv"), sep = "," )
+d.roma <- read_ods( here("_raw","ROMA-ITEMPOVyeteni_DATA_2024-05-02.ods") )
+d.gba <- read.xlsx( here("_raw","GBA_iTEMPO.xlsx") )
+
+# pre-process
+d1 <-
   
-  lapply(
-    
-    setNames( c("motor","psych"), c("motor","psych") ),
-    function(i)
-      read.csv( here( "_raw", paste0(i,"_longit.csv") ), sep = "," ) %>%
-      mutate( gba = ifelse( id %in% c( read.table( here("_raw","gba.txt"), header = F ) )$V1, 1, 0 ), .after = sex )
+  d0 %>%
+  filter( id %in% substr(d.roma$ipn, 1, 6) ) %>% # keep only patients with genetic data
+  filter( stn_dbs == 1 ) %>% # keep only STN DBS patients
+  filter( complete.cases(drsii) ) %>% # keep rows with DRS-2 only
+  mutate( GBA = factor( ifelse( id %in% d.gba$IPN, 1, 0 ) ), .after = sex ) %>% # add GBA indicator
+  mutate( md_time = median(stimtime_years[event == "screening"], na.rm = T), time = stimtime_years - md_time ) %>% # shift time such that median pre-surgery assessment is t0
+  select( id, event, GBA, time, md_time, drsii ) # select variables of interest
+
+# plot assessment distributions
+table( d1[ , c("id","event","GBA") ] ) %>%
+  as.data.frame() %>%
+  mutate(
+    `GBA: ` = case_when(
+      GBA == 1 & Freq == 1 ~ "GBA+",
+      GBA == 0 & Freq == 1 ~ "GBA-",
+      .default = NA
+    ),
+    event = factor(event, levels = c("screening", paste0( "y",seq(1,19,2) ) ), ordered = T )
+  ) %>%
+  filter( complete.cases(`GBA: `) ) %>%
   
+  ggplot() +
+  aes( y = id, x = event, fill = `GBA: ` ) +
+  geom_tile( colour = "white" ) +
+  scale_fill_manual( values = c("grey82", "#0072B2" ) ) +
+  labs(
+    title = "DRS-2 assessment distributions across patients",
+    subtitle = "coloured fields indicate cases present in the data",
+    y = NULL,
+    x = NULL
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text( size = 16, face = "bold", hjust = .5 ),
+    plot.subtitle = element_text( size = 14, hjust = .5 )
   )
+
+# save it
+ggsave( plot = last_plot(), filename = here("figs","assessment_distributions.jpg"), dpi = 300, width = 8, height = 16.2 )
 
 
 # REGRESSION MODELS OF DRS-2 ----
-
-# prepare folder for models
-if (!dir.exists("mods") ) dir.create("mods")
-
-# compute shifted time from surgery
-md_time <- median( d0$psych[ d0$psych$event == "screening" & complete.cases(d0$psych$drsii), "stimtime_years"], na.rm = T )
-
-# prepare data for analysis
-d1 <-
-  d0$psych %>%
-  filter( complete.cases(drsii) ) %>% # keep rows with DRS-2 only
-  mutate( time = stimtime_years - md_time ) %>% # shift time such that median pre-surgery assessment is t0
-  mutate( GBA = as.character(gba) ) %>% # for brms to not read GBA as a number
-  select( id, GBA, time, drsii, faq, pdaq, bdi, staix1, staix2 ) # select variables of interest
 
 # set-up model formulas (i.e., linear models)
 f <-
@@ -53,9 +82,9 @@ f <-
 n <-
   
   list(
-    replicate = "mu ~ 1 + GBA * Time + (1 + Time | ID),\nsigma ~ 1, Gaussian",
-    heterosce = "mu ~ 1 + GBA * Time + (1 + Time | ID),\nsigma ~ 1 + Time, Gaussian",
-    betabinom = "mu ~ 1 + GBA * Time + (1 + Time | ID),\nphi ~ 1 + Time, Beta-Binomial"
+    replicate = "Normal(mu, sigma) likelihood\n\nmu ~ 1 + GBA * Time + (1 + Time | ID),\nsigma ~ 1",
+    heterosce = "Normal(mu, sigma) likelihood\n\nmu ~ 1 + GBA * Time + (1 + Time | ID),\nsigma ~ 1 + Time",
+    betabinom = "Beta-Binomial(mu, phi) likelihood\n\nmu ~ 1 + GBA * Time + (1 + Time | ID),\nphi ~ 1 + Time"
   )
 
 # use default brms priors for this exploration
@@ -73,9 +102,6 @@ m <-
   )
 
 # POSTERIOR PREDICTIVE CHECKS ----
-
-# prepare folder for figures
-if (!dir.exists("figs") ) dir.create("figs")
 
 ## statistics prediction ----
 
@@ -112,7 +138,7 @@ with(
     ( replicate$sd | heterosce$sd | betabinom$sd ) /
     ( replicate$median | heterosce$median | betabinom$median ) /
     ( replicate$IQR | heterosce$IQR | betabinom$IQR ) +
-    plot_layout( heights = c(1.5,1,1,1,1) )
+    plot_layout( heights = c(1.6,1,1,1,1) )
 )
 
 # save it
